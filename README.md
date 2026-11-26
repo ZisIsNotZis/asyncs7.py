@@ -1,4 +1,7 @@
 # asyncs7
+
+**项目状态 · 未完成（2026-11-26）**。S7 DBRead Python 库；协议原型、未见可复核的安装和本地验收。 先修发行包并验证安装，随后从可重复的本地模拟端验证读块。
+
 A lightweight, async Python library for communicating with Siemens S7 PLCs over Ethernet/IP. This library provides an asynchronous interface for reading data blocks (DBRead) from S7 PLCs, with a focus on simplicity and proper asyncio usage.
 
 ## Features
