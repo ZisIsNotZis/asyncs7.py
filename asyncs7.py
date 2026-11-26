@@ -1,48 +1,70 @@
 """
-Usage:
+A small pure-asyncio client for reading data blocks (DB) from Siemens S7 PLCs over
+ISO-on-TCP (RFC 1006, TCP port 102).
+
+Supported: TCP connect, COTP connect, S7 PDU-size negotiation, Read-Var on standard DB
+areas with `(db, byte_address, size)` items, up to `MaxVars` items per request, request
+serialization on one connection, timeouts, and explicit errors for PLC return codes.
+
+Not supported: writes, symbolic addressing, other protocol areas (only DB), automatic
+reconnect, or parallel requests on one connection (the connection is serial by protocol).
+
 ```py
-from asyncs7 import S7
-s7 = await s7(ip, port, rack, slot)
-dat: dict[Annotated[int, 'db'], Annotated[bytearray, 'start from 0']] = await s7(db, adr, sz) # DBRead
+from asyncs7 import S7Client
+
+async with S7Client('192.168.0.1', rack=0, slot=1) as s7:
+    blocks = await s7((1, 0, 10), (1, 20, 4))   # [bytearray, bytearray], in request order
+    data = await s7.read_one(1, 0, 10)          # just the bytes of DB1[0:10]
 ```
 
-Note that s7 connection is serial. Therefore please don't try to make another request on the same connection while one request is processing.
+Or without a context manager: ``s7 = await S7('192.168.0.1', 102, 0, 1)``; then ``s7.close()``.
+
+The S7 connection is serial: requests on one client wait on a lock, so several tasks may
+share one client, but throughput stays one request at a time. Use one client per stream when
+you need parallel connections.
+
+Requires Python 3.11+; a wheel was built and imported from clean 3.11 and 3.14 installs.
 """
 
-from asyncio import open_connection, Task, sleep, new_event_loop
-from ctypes import BigEndianStructure, c_ubyte, c_ushort, sizeof, BigEndianUnion, memmove, addressof, Array
-from itertools import groupby
+from asyncio import Lock, IncompleteReadError, run, timeout, open_connection
+from ctypes import BigEndianStructure, c_ubyte, c_ushort, sizeof, memmove, addressof, Array
 from logging import debug
 from math import log2
-from typing import Annotated, get_origin, get_args, Iterator, Callable, Awaitable
+from typing import Annotated, get_origin, get_args, Iterator
 
-try:
-    from uvloop import new_event_loop
-except ImportError:
-    pass
 MaxVars = 20
-IsoPayloadSize = 4096
+__version__ = '0.3.1'
 
 
-def fields[T](_: T) -> T:
-    _._pack_ = 1
-    _._fields_ = [(i, get_args(j)[0] if get_origin(j) == Annotated else j) for i, j in _.__annotations__.items()]
-    return _
+def fields(cls):
+    '''Build the ctypes layout from the Annotated annotations declared on a Struct subclass.
+
+    The annotations are copied onto the class as ``_declared_``: since Python 3.14 a ctypes
+    structure instance no longer exposes ``__annotations__`` (it must come from the type).
+    '''
+    cls._pack_ = 1
+    cls._layout_ = 'ms'  # explicit now that the implicit _pack_=1 layout is deprecated
+    # PEP 649 (3.14+) keeps annotations out of cls.__dict__ until first access; reading the
+    # attribute triggers evaluation and caches it, while 3.11 stores the dict directly.
+    ann = cls.__dict__.get('__annotations__') or getattr(cls, '__annotations__', {})
+    cls._declared_ = dict(ann)
+    cls._fields_ = [(i, get_args(j)[0] if get_origin(j) == Annotated else j)
+                    for i, j in cls._declared_.items()]
+    return cls
 
 
 def Str(_) -> str:
-    return f'[{','.join(map(str, _))}]' if isinstance(_, Array) else str(_)
-
-
-def Size(_) -> int:
-    return getattr(_, '_size', lambda: sizeof(_))()
+    return '[' + ','.join(map(str, _)) + ']' if isinstance(_, Array) else str(_)
 
 
 class Struct(BigEndianStructure):
+    '''Big-endian, byte-packed wire structure: default values come from the annotations.'''
+
     __slots__ = ()
+    _layout_ = 'ms'  # byte-packed MSVC layout; fields() sets it per class too
 
     def __init__(self):
-        for i, _ in self.__annotations__.items():
+        for i, _ in type(self)._declared_.items():
             if get_origin(_) == Annotated:
                 setattr(self, i, get_args(_)[1])
             else:
@@ -52,41 +74,19 @@ class Struct(BigEndianStructure):
         return (getattr(self, i) for i, _ in self._fields_)
 
     def __str__(self):
-        return f'{type(self).__name__}({','.join(map(Str, self))})'
+        return type(self).__name__ + '(' + ','.join(map(Str, self)) + ')'
 
-    def _size(self) -> int:
-        return sum(map(Size, self))
-
-
-class Union(BigEndianUnion):
-    __slots__ = '_i',
-
-    def __init__(self):
-        self._i = ''
-        getattr(self, next(iter(self.__annotations__))).__init__()
-
-    def __iter__(self) -> Iterator:
-        return (getattr(self, i) for i, _ in self._fields_)
-
-    def __setattr__(self, key, value):
-        self.key = key
-        super().__setattr__(key, value)
-
-    def __str__(self):
-        return str(getattr(self, self._i)) if self._i else '|'.join(map(Str, self))
-
-    def size(self) -> int:
-        assert self._i
-        return getattr(self, self._i)._size()
+    def __bytes__(self) -> bytes:
+        return bytes(memoryview(self))
 
 
 @fields
 class Tpkt(Struct):
-    '''TPKT Header - ISO on TCP - RFC 1006 (4 bytes), Packet length : min 7 max 65535'''
+    '''TPKT header, ISO on TCP, RFC 1006 (4 bytes): version, reserved, total frame length.'''
     __slots__ = ()
-    Version: Annotated[c_ubyte, 3]  # Always 3 for RFC 1006
-    Reserved: c_ubyte  # 0
-    Lenght: c_ushort  # packet lenght (entire frame, payload and TPDU included)
+    Version: Annotated[c_ubyte, 3]
+    Reserved: c_ubyte
+    Lenght: c_ushort  # spelling kept from the original protocol tables
 
 
 @fields
@@ -94,142 +94,151 @@ class CotpParams(Struct):
     __slots__ = ()
     PduSizeCode: Annotated[c_ubyte, 0xC0]
     PduSizeLen: Annotated[c_ubyte, 1]
-    PduSizeVal: Annotated[c_ubyte, int(log2(1024))]  # IsoPDUSize
-    TSAP: Annotated[c_ushort * 4, (0xC102,  # code that identifies source TSAP, source TSAP Len
-                                   0x0100,  # SrcTSap
-                                   0xC202,  # code that identifies dest TSAP, dest TSAP Len
-                                   0x0100  # DstTSap, (ConnectionType<<8)+(Rack*0x20)+Slot
-                                   )]
+    PduSizeVal: Annotated[c_ubyte, int(log2(1024))]
+    TSAP: Annotated[c_ushort * 4, (0xC102, 0x0100, 0xC202, 0x0100)]
 
 
 @fields
 class CotpCo(Struct):
-    '''COTP Header for CONNECTION REQUEST/CONFIRM - DISCONNECT REQUEST/CONFIRM'''
+    '''COTP connection request/confirm header.'''
     __slots__ = ()
-    HLength: Annotated[c_ubyte, 6 + 11]  # Header length : initialized to 6 (length without params - 1)
-    PDUType: Annotated[c_ubyte, 0xe0]  # 0xE0 Connection request, 0xD0 Connection confirm, 0x80 Disconnect request, 0xDC Disconnect confirm
-    DstRef: c_ushort  # Destination reference, Always 0x0000
-    SrcRef: c_ushort  # Source reference, Always 0x0000
-    CO_R: c_ubyte  # If the telegram is used for Connection request/Confirm, the meaning of this field is CLASS+OPTION, Class, Always 4 (0100) but is ignored in input (RFC States this), Option, Always 0, also this in ignored.
-    Params: CotpParams  # Parameter data : depending on the protocol implementation. ISO 8073 define several type of parameters, but RFC 1006 recognizes only. TSAP related parameters and PDU size.  See RFC 0983 for more details.
-
-
-@fields
-class IsoControlPDU(Struct):
-    __slots__ = ()
-    TPKT: Annotated[Tpkt, Tpkt(sizeof(CotpCo))]
-    COTP: CotpCo  # COPT Header for CONNECTION stuffs
-
-    def __init__(self, rack=0, slot=0):
-        super().__init__()
-        self.COTP.Params.TSAP[3] = 0x0100 | (rack << 5) | slot
+    HLength: Annotated[c_ubyte, 6 + 11]
+    PDUType: Annotated[c_ubyte, 0xe0]
+    DstRef: c_ushort
+    SrcRef: c_ushort
+    CO_R: c_ubyte
+    Params: CotpParams
 
 
 @fields
 class CotpDt(Struct):
-    '''COTP Header for DATA EXCHANGE'''
+    '''COTP data-transfer header.'''
     __slots__ = ()
-    HLength: Annotated[c_ubyte, 2]  # Header length, 3 for this header
-    PDUType: Annotated[c_ubyte, 0xf0]  # 0xF0 for this header
-    EoT_Num: Annotated[c_ubyte, 0x80]  # EOT (bit 7) + PDU Number (bits 0..6), EOT 1 -> End of Trasmission Packet (This packet is complete, PDU Number, Always 0
+    HLength: Annotated[c_ubyte, 2]
+    PDUType: Annotated[c_ubyte, 0xf0]
+    EoT_Num: Annotated[c_ubyte, 0x80]
 
 
-@fields
-class ReqFunNegotiateParams(Struct):
-    '''FUNCTION NEGOTIATE'''
-    __slots__ = ()
-    FunNegotiate: Annotated[c_ubyte, 0xF0]  # pduNegotiate, Negotiate PDU length
-    Unknown: c_ubyte
-    ParallelJobs_1: Annotated[c_ushort, 0x0100]
-    ParallelJobs_2: Annotated[c_ushort, 0x0100]
-    PDULength: Annotated[c_ushort, 480]  # Our request, FPDULength will contain the CPU answer
+def connect_frame(rack: int = 0, slot: int = 0) -> bytes:
+    '''COTP connection request for the given rack/slot, with a valid TPKT length.'''
+
+    @fields
+    class PDU(Struct):
+        TPKT: Tpkt
+        COTP: CotpCo
+
+    pdu = PDU()
+    pdu.COTP.Params.TSAP[3] = 0x0100 | (rack << 5) | slot
+    pdu.TPKT.Lenght = sizeof(PDU)
+    return bytes(pdu)
 
 
 @fields
 class S7ReqHeader(Struct):
-    '''Incoming header, it will be mapped onto IsoPDU payload'''
     __slots__ = ()
-    P: Annotated[c_ubyte, 0x32]  # Telegram ID, always 32, Always $32
-    PDUType: Annotated[c_ubyte, 1]  # Header type 1 or 7, $01
-    AE_XB: c_ushort  # AB currently unknown, maybe it can be used for long numbers, Always $0000
-    Sequence: c_ushort  # Message ID. This can be used to make sure a received answer, AutoInc
-    ParLen: c_ushort  # Length of parameters which follow this header
-    DataLen: c_ushort  # Length of data which follow the parameters
+    P: Annotated[c_ubyte, 0x32]  # always 0x32
+    PDUType: Annotated[c_ubyte, 1]
+    AE_XB: c_ushort
+    Sequence: c_ushort
+    ParLen: c_ushort
+    DataLen: c_ushort
+
+
+@fields
+class ReqFunNegotiateParams(Struct):
+    '''S7 PDU-size negotiation request.'''
+    __slots__ = ()
+    FunNegotiate: Annotated[c_ubyte, 0xF0]
+    Unknown: c_ubyte
+    ParallelJobs_1: Annotated[c_ushort, 0x0100]
+    ParallelJobs_2: Annotated[c_ushort, 0x0100]
+    PDULength: Annotated[c_ushort, 480]
+
+    def _size(self) -> int:
+        return 8
 
 
 @fields
 class ReqFunReadItem(Struct):
     __slots__ = ()
     ItemHead: Annotated[c_ubyte * 3, (0x12, 0x0A, 0x10)]
-    TransportSize: Annotated[c_ubyte, 0x02]
+    TransportSize: Annotated[c_ubyte, 0x02]  # 0x02 = byte
     Length: c_ushort
     DBNumber: c_ushort
-    Area: Annotated[c_ubyte, 0x84]
+    Area: Annotated[c_ubyte, 0x84]  # 0x84 = data block
     Address: c_ubyte * 3
 
 
-@fields
-class ReqFunReadParams(Struct):
-    __slots__ = ()
-    FunRead: Annotated[c_ubyte, 0x04]  # pduFuncRead
-    ItemsCount: c_ubyte
-    Items: ReqFunReadItem * MaxVars
-
-    def __init__(self, *dbAdrSz: tuple[int, int, int]):
-        super().__init__()
-        self.ItemsCount = len(dbAdrSz)
-        for i, ((db, adr, sz), itm) in enumerate(zip(dbAdrSz, self.Item)):
-            itm.DBNumber = db
-            itm.Address = adr.to_bytes(3, 'big')
-            itm.Length = sz
-
-    def _size(self) -> int:
-        return 2 + self.ItemsCount * sizeof(ReqFunReadItem)
+ITEM_SIZE = sizeof(ReqFunReadItem)  # 12 bytes
 
 
-@fields
-class S7ReqUnion(Union):
-    __slots__ = ()
-    Negotiate: ReqFunNegotiateParams
-    Read: ReqFunReadParams
+def _sized(pdu: Struct, frame_size: int, par_len: int, seq: int, data_len: int = 0) -> bytes:
+    '''Set the TPKT length and S7 header counters, then return the frame without array padding.'''
+    pdu.TPKT.Lenght = frame_size
+    pdu.Header.Sequence = seq
+    pdu.Header.ParLen = par_len
+    pdu.Header.DataLen = data_len
+    return bytes(pdu)[:frame_size]
 
 
-@fields
-class S7ReqPDU(Struct):
-    __slots__ = ('_i',)
-    TPKT: Tpkt
-    COTP: CotpDt  # COPT Header for DATA EXCHANGEctypes._endian.c_ushort_be_Array_4
-    Header: S7ReqHeader
-    Payload: S7ReqUnion
+HEAD_SIZE = sizeof(Tpkt) + sizeof(CotpDt) + sizeof(S7ReqHeader)  # 4 + 3 + 10 = 17
 
-    def __init__(self, *dbAdrSz: tuple[int, int, int]):
-        super().__init__()
-        self._i = 0
-        if dbAdrSz:
-            self.Payload.Read = ReqFunReadParams(*dbAdrSz)
-        else:
-            self.Payload.Negotiate = ReqFunNegotiateParams()
-        self.Header.Sequence = type(self)._i = (self._i + 1) & 0xFFFF
-        self.Header.ParLen = self.Payload.size()
-        self.TPKT = self._size()
+
+def negotiate_frame(sequence: int = 0) -> bytes:
+    '''S7 negotiate-PDU request (asks the PLC for its PDU length).'''
+
+    @fields
+    class PDU(Struct):
+        TPKT: Tpkt
+        COTP: CotpDt
+        Header: S7ReqHeader
+        Params: ReqFunNegotiateParams
+
+    pdu = PDU()
+    return _sized(pdu, sizeof(PDU), sizeof(ReqFunNegotiateParams), sequence)
+
+
+def read_frame(items, sequence: int = 0) -> bytes:
+    '''S7 Read-Var request for ``(db, adr, sz)`` items (at most ``MaxVars`` per frame).'''
+
+    @fields
+    class PDU(Struct):
+        TPKT: Tpkt
+        COTP: CotpDt
+        Header: S7ReqHeader
+        FunRead: Annotated[c_ubyte, 0x04]
+        ItemsCount: c_ubyte
+        Items: ReqFunReadItem * MaxVars
+
+    pdu = PDU()
+    pdu.ItemsCount = len(items)
+    for (db, adr, sz), itm in zip(items, pdu.Items):
+        # Array elements never run ReqFunReadItem.__init__, so spell out its constants here.
+        for k, b in enumerate((0x12, 0x0A, 0x10)):
+            itm.ItemHead[k] = b
+        itm.TransportSize, itm.Area = 0x02, 0x84
+        itm.DBNumber = db
+        # S7 addresses are in bits: a byte offset `adr` is bit address `adr * 8`, bit 0.
+        for k, b in enumerate((adr * 8).to_bytes(3, 'big')):
+            itm.Address[k] = b
+        itm.Length = sz
+    return _sized(pdu, HEAD_SIZE + 2 + len(items) * ITEM_SIZE, 2 + len(items) * ITEM_SIZE, sequence)
 
 
 @fields
 class S7ResHeader(Struct):
-    '''Outcoming 12 bytes header , response for Request type 1'''
     __slots__ = ()
-    P: c_ubyte  # Telegram ID, always 32
-    PDUType: c_ubyte  # Header type 2 or 3
-    AB_EX: c_ushort  # AB currently unknown, maybe it can be used for long numbers.
-    Sequence: c_ushort  # Message ID. This can be used to make sure a received answer
-    ParLen: c_ushort  # Length of parameters which follow this header
-    DataLen: c_ushort  # Length of data which follow the parameters
-    Error: c_ushort  # Error code
+    P: c_ubyte
+    PDUType: c_ubyte
+    AB_EX: c_ushort
+    Sequence: c_ushort
+    ParLen: c_ushort
+    DataLen: c_ushort
+    Error: c_ushort
 
 
 @fields
 class ResFunNegotiateParams(Struct):
-    '''FUNCTION NEGOTIATE'''
     __slots__ = ()
     FunNegotiate: c_ubyte
     Unknown: c_ubyte
@@ -246,82 +255,226 @@ class ResFunReadParams(Struct):
 
 
 @fields
-class ResFunReadItem(Struct):
-    __slots__ = ()
-    ReturnCode: c_ubyte
-    TransportSize: c_ubyte
-    DataLength: c_ushort
-    Data: c_ubyte * (IsoPayloadSize - 17)
-
-
-@fields
-class S7ResRead(Struct):
-    __slots__ = ()
-    Params: ResFunReadParams
-    Data: ResFunReadItem * MaxVars
-
-
-@fields
-class S7ResUnion(Union):
-    __slots__ = ()
-    Negotiate: ResFunNegotiateParams
-    Read: S7ResRead
-
-
-@fields
 class S7ResPDU(Struct):
+    '''Fixed head of an answer frame: TPKT, COTP and the 12-byte S7 response header.'''
     __slots__ = ()
     TPKT: Tpkt
-    COTP: CotpDt  # COPT Header for DATA EXCHANGE
+    COTP: CotpDt
     Header: S7ResHeader
-    Payload: S7ResUnion
 
 
-async def S7(ip='127.0.0.1', port=102, rack=0, slot=0) -> Callable[[tuple[int, int, int]], Awaitable[dict[int, bytearray]]]:
-    reader, writer = await open_connection(ip, port)
-
-    def write(a):
-        debug('<<< %s', a)
-        writer.write(bytearray(a)[:a.TPKT.Lenght])
-
-    async def read[T](reader, a: T) -> T:
-        memmove(addressof(a.TPKT), await reader.readexactly(sizeof(Tpkt)), sizeof(Tpkt))
-        memmove(addressof(a.TPKT) + sizeof(Tpkt), await reader.readexactly(a.TPKT.Lenght - sizeof(Tpkt)), a.TPKT.Lenght - sizeof(Tpkt))
-        debug('>>> %s', a)
-        return a
-
-    write(IsoControlPDU(rack, slot))
-    await read(reader, IsoControlPDU.__new__(IsoControlPDU))
-    write(S7ReqPDU())
-    debug('pdu %d', (await read(reader, S7ResPDU.__new__(S7ResPDU))).Payload.Negotiate.PDULength)
-
-    async def _(*dbAdrSz: tuple[int, int, int]) -> dict[int, bytearray]:
-        write(S7ReqPDU(*dbAdrSz))
-        res = await read(reader, S7ResPDU.__new__(S7ResPDU))
-        buf = {db: bytearray(max(_[2] for _ in _)) for db, _ in groupby(dbAdrSz, lambda _: _[0])}
-        for (db, i, j), itm in zip(dbAdrSz, res.Payload.Read.Data[:res.Payload.Read.Params.ItemCount]):
-            itm: ResFunReadItem
-            assert itm.ReturnCode == 0xFF
-            buf[db][i:j] = itm.Data[:itm.DataLength]
-        return buf
-
-    return _
+RES_HEAD_SIZE = sizeof(S7ResPDU)  # 19 bytes
 
 
-async def bench(*ipPortRackSlotDbAdrSz):
-    _ = [0] * len(ipPortRackSlotDbAdrSz)
-    for i, (ip, port, rack, slot, db, adr, sz) in enumerate(ipPortRackSlotDbAdrSz):
-        @lambda _: Task(_())
-        async def _(i=i, ip=ip, port=port, rack=rack, slot=slot, db=db, adr=adr, sz=sz):
-            s7 = await S7(ip, port, rack, slot)
-            while True:
-                await s7((db, adr, sz))
-                _[i] += 1
-    while True:
-        await sleep(1)
-        print(_)
-        _[:] = (0,) * len(ipPortRackSlotDbAdrSz)
+class S7Error(ConnectionError):
+    '''The PLC answered, but the answer is an error (return code, malformed or unexpected frame).'''
+
+
+class S7TimeoutError(TimeoutError):
+    '''No complete answer arrived before the timeout; the connection has been closed.'''
+
+
+def item_bytes(transport_size: int, data_length: int) -> int:
+    '''Payload length of a read item: transport size 0x04 (BIT) counts bits, others count bytes.'''
+    return data_length // 8 if transport_size == 0x04 else data_length
+
+
+def parse_read_items(data: bytes, item_count: int) -> list[tuple[int, int, int, bytes]]:
+    '''Split a read-response data section into (return_code, transport_size, data_length, payload).'''
+    items = []
+    pos = 0
+    for _ in range(item_count):
+        if pos + 4 > len(data):
+            raise S7Error(f'read response truncated after {pos} bytes: item head incomplete')
+        rc, ts = data[pos], data[pos + 1]
+        dl = int.from_bytes(data[pos + 2:pos + 4], 'big')
+        pos += 4
+        n = item_bytes(ts, dl)
+        items.append((rc, ts, dl, data[pos:pos + n]))
+        pos += n
+    return items
+
+
+class S7Client:
+    '''One S7 connection: `async with S7Client(ip, rack=..., slot=...)` or `await client.connect()`.'''
+
+    def __init__(self, ip: str = '127.0.0.1', port: int = 102, rack: int = 0, slot: int = 0,
+                 timeout: float = 5.0):
+        self.ip, self.port, self.rack, self.slot = ip, port, rack, slot
+        self.timeout = timeout
+        self.reader = self.writer = None
+        self.pdu_length = 480  # PLC's answer to the negotiate request; also the frame ceiling
+        self.sequence = 0
+        self._lock = Lock()
+
+    @property
+    def connected(self) -> bool:
+        return self.writer is not None and not self.writer.is_closing()
+
+    async def __aenter__(self) -> 'S7Client':
+        return await self.connect()
+
+    async def __aexit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+        self.reader = self.writer = None
+
+    def _next_sequence(self) -> int:
+        self.sequence = (self.sequence + 1) & 0xFFFF
+        return self.sequence
+
+    def _send(self, frame: bytes) -> None:
+        debug('<<< %s', frame.hex())
+        self.writer.write(frame)
+
+    async def _recv(self) -> bytes:
+        '''Read exactly one TPKT frame from the socket.'''
+        try:
+            async with timeout(self.timeout):
+                head = await self.reader.readexactly(sizeof(Tpkt))
+                length = int.from_bytes(head[2:4], 'big')
+                if not sizeof(Tpkt) <= length <= 0xFFFF:
+                    raise S7Error(f'bad TPKT length {length}')
+                return head + await self.reader.readexactly(length - sizeof(Tpkt))
+        except (TimeoutError, IncompleteReadError) as e:
+            self.close()
+            raise S7TimeoutError(
+                f'no complete answer from {self.ip}:{self.port} within {self.timeout}s') from e
+
+    async def connect(self) -> 'S7Client':
+        '''TCP connect, COTP connect and S7 PDU-size negotiation.'''
+        self.close()
+        self.reader, self.writer = await open_connection(self.ip, self.port)
+        try:
+            self._send(connect_frame(self.rack, self.slot))
+            await self._recv()
+            self._send(negotiate_frame(self._next_sequence()))
+            body = await self._recv()
+            pdu = S7ResPDU.__new__(S7ResPDU)
+            memmove(addressof(pdu), body, min(len(body), sizeof(pdu)))
+            if pdu.Header.P != 0x32:
+                raise S7Error(f'negotiation answer is not an S7 frame (id 0x{pdu.Header.P:02X})')
+            params = ResFunNegotiateParams.__new__(ResFunNegotiateParams)
+            memmove(addressof(params), body[RES_HEAD_SIZE:], sizeof(params))
+            self.pdu_length = params.PDULength or 480
+            debug('pdu %d', self.pdu_length)
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    async def read(self, *db_adr_sz: tuple[int, int, int]) -> list[bytearray]:
+        '''Read (db, adr, sz) items; one bytearray per item, in request order.'''
+        items = tuple(db_adr_sz)
+        if not items:
+            raise ValueError('give at least one (db, adr, sz) triple')
+        if len(items) > MaxVars:
+            raise ValueError(f'at most {MaxVars} items per request, got {len(items)}')
+        for db, adr, sz in items:
+            if not (0 <= db <= 0xFFFF and 0 <= adr <= 0xFFFFFF and 1 <= sz <= 0xFFFF):
+                raise ValueError(f'invalid (db={db}, adr={adr}, sz={sz})')
+        if not self.connected:
+            raise S7Error('connection is closed')
+        frame = read_frame(items, self._next_sequence())
+        if len(frame) > self.pdu_length:
+            raise ValueError(f'request of {len(frame)} bytes exceeds the negotiated '
+                             f'PDU size {self.pdu_length}; split it into fewer/smaller items')
+        # The S7 connection is serial: one request in flight, other callers wait here.
+        async with self._lock:
+            self._send(frame)
+            body = await self._recv()
+        res = S7ResPDU.__new__(S7ResPDU)
+        memmove(addressof(res), body, min(len(body), sizeof(res)))
+        h = res.Header
+        if h.P != 0x32:
+            raise S7Error(f'not an S7 frame (id 0x{h.P:02X})')
+        if h.PDUType not in (2, 3):
+            raise S7Error(f'unexpected PDU type 0x{h.PDUType:02X}')
+        params = ResFunReadParams.__new__(ResFunReadParams)
+        memmove(addressof(params), body[RES_HEAD_SIZE:], sizeof(params))
+        if params.FunRead != 0x04:
+            raise S7Error(f'answer is not a read response (function 0x{params.FunRead:02X})')
+        if params.ItemCount != len(items):
+            raise S7Error(f'asked for {len(items)} items, PLC answered {params.ItemCount}')
+        parsed = parse_read_items(
+            body[RES_HEAD_SIZE + h.ParLen:RES_HEAD_SIZE + h.ParLen + h.DataLen], params.ItemCount)
+        results = []
+        for (db, adr, sz), (rc, ts, dl, payload) in zip(items, parsed):
+            if rc != 0xFF:
+                raise S7Error(f'read DB{db}@{adr}:{sz} failed with return code 0x{rc:02X}')
+            if len(payload) != sz:
+                raise S7Error(f'read DB{db}@{adr}:{sz}: expected {sz} bytes, got {len(payload)} '
+                              f'(transport size 0x{ts:02X}, length {dl})')
+            results.append(bytearray(payload))
+        return results
+
+    __call__ = read
+
+    async def read_one(self, db: int, adr: int = 0, sz: int = 1) -> bytearray:
+        '''Read a single range and return its bytes directly.'''
+        return (await self.read((db, adr, sz)))[0]
+
+
+async def S7(*args, **kwargs) -> 'S7Client':
+    '''Shortcut: `s7 = await S7(ip, port, rack, slot)` returns a connected client.'''
+    return await S7Client(*args, **kwargs).connect()
+
+
+def main(argv=None) -> int:
+    '''Demo entry point: read blocks from a PLC (or the synthetic server) and print them.'''
+    import argparse
+    import asyncio as aio
+
+    parser = argparse.ArgumentParser(
+        prog='asyncs7', description='Read DB blocks from an S7 PLC. Demo by default.')
+    parser.add_argument('host', nargs='?', default='127.0.0.1')
+    parser.add_argument('port', nargs='?', type=int, default=1102)
+    parser.add_argument('--rack', type=int, default=0)
+    parser.add_argument('--slot', type=int, default=0)
+    parser.add_argument('--timeout', type=float, default=5.0)
+    parser.add_argument('--db', type=int, default=1, help='data block to read (default 1)')
+    parser.add_argument('--adr', type=int, default=0, help='byte offset (default 0)')
+    parser.add_argument('--size', type=int, default=16, help='bytes to read (default 16)')
+    parser.add_argument('--bench', type=float, metavar='SECONDS',
+                        help='measure reads per second for this many seconds instead')
+    args = parser.parse_args(argv)
+
+    async def run() -> int:
+        client = S7Client(args.host, args.port, args.rack, args.slot, args.timeout)
+        try:
+            async with client:
+                print(f'connected to {args.host}:{args.port}, PDU length {client.pdu_length}')
+                if args.bench:
+                    count, deadline = 0, aio.get_running_loop().time() + args.bench
+                    while aio.get_running_loop().time() < deadline:
+                        await client.read_one(args.db, args.adr, args.size)
+                        count += 1
+                    print(f'{count / args.bench:.0f} reads/s ({args.size} bytes from DB{args.db})')
+                    return 0
+                data = await client.read_one(args.db, args.adr, args.size)
+                print(f'DB{args.db}[{args.adr}:{args.adr + len(data)}] = {data.hex()}')
+                return 0
+        # S7Error and S7TimeoutError both subclass OSError (ConnectionError/TimeoutError),
+        # so they must come first or a PLC error would be reported as "cannot connect".
+        except S7TimeoutError as e:
+            print(f'timeout: {e}')
+            return 1
+        except S7Error as e:
+            print(f'S7 error: {e}')
+            return 1
+        except OSError as e:
+            print(f'cannot connect to {args.host}:{args.port}: {e}')
+            print('for a local demo, start the synthetic server first: python demo_s7.py')
+            return 2
+
+    try:
+        return aio.run(run())
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == '__main__':
-    new_event_loop().run_until_complete(bench(('127.0.0.1', 1102, 0, 0, 0, 0, 100)))
+    raise SystemExit(main())

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asyncs7"
+version = "0.3.1"
+description = "A small pure-asyncio client for reading data blocks (DB) from Siemens S7 PLCs over ISO-on-TCP (RFC 1006)."
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Manufacturing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/ZisIsNotZis/asyncs7.py"
+
+[project.scripts]
+asyncs7 = "asyncs7:main"
+
+[tool.setuptools]
+py-modules = ["asyncs7", "demo_s7"]
